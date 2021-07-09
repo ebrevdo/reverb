@@ -16,7 +16,25 @@
 #define REVERB_CC_PLATFORM_DEFAULT_STATUS_H_
 
 #include "absl/status/status.h"
-#include "reverb/cc/platform/default/status_builder.h"
+
+#ifdef __has_builtin
+#define REVERB_HAS_BUILTIN(x) __has_builtin(x)
+#else
+#define REVERB_HAS_BUILTIN(x) 0
+#endif
+
+// Compilers can be told that a certain branch is not likely to be taken
+// (for instance, a CHECK failure), and use that information in static
+// analysis. Giving it this information can help it optimize for the
+// common case in the absence of better information (ie.
+// -fprofile-arcs).
+#if REVERB_HAS_BUILTIN(__builtin_expect) || (defined(__GNUC__) && __GNUC__ >= 3)
+#define REVERB_PREDICT_FALSE(x) (__builtin_expect(x, 0))
+#define REVERB_PREDICT_TRUE(x) (__builtin_expect(!!(x), 1))
+#else
+#define REVERB_PREDICT_FALSE(x) (x)
+#define REVERB_PREDICT_TRUE(x) (x)
+#endif
 
 // Evaluates an expression that produces a `absl::Status`. If the status
 // is not ok, returns it from the current function.
@@ -62,12 +80,12 @@
 //     REVERB_RETURN_IF_ERROR(foo.Method(args...));
 //     return absl::OkStatus();
 //   }
-#define REVERB_RETURN_IF_ERROR(expr)                                      \
-  STATUS_MACROS_IMPL_ELSE_BLOCKER_                                        \
-  if (internal::status_macro_internal::StatusAdaptorForMacros             \
-          status_macro_internal_adaptor = {(expr), __FILE__, __LINE__}) { \
-  } else /* NOLINT */                                                     \
-    return status_macro_internal_adaptor.Consume()
+#define REVERB_RETURN_IF_ERROR(...)                      \
+  do {                                                   \
+    ::absl::Status _status = (__VA_ARGS__);                  \
+    if (REVERB_PREDICT_FALSE(!_status.ok())) return _status; \
+  } while (0)
+
 
 // Executes an expression `rexpr` that returns a `absl::StatusOr<T>`. On
 // OK, extracts its value into the variable defined by `lhs`, otherwise returns
@@ -116,96 +134,13 @@
 //   REVERB_ASSIGN_OR_RETURN(
 //.      ValueType value, MaybeGetValue(query), _.LogError());
 //
-#define REVERB_ASSIGN_OR_RETURN(...)                                         \
-  STATUS_MACROS_IMPL_GET_VARIADIC_((__VA_ARGS__,                             \
-                                    STATUS_MACROS_IMPL_ASSIGN_OR_RETURN_3_,  \
-                                    STATUS_MACROS_IMPL_ASSIGN_OR_RETURN_2_)) \
-  (__VA_ARGS__)
+#define REVERB_ASSIGN_OR_RETURN_IMPL(statusor, lhs, rexpr) \
+  auto statusor = (rexpr);                             \
+  if (REVERB_PREDICT_FALSE(!statusor.ok())) {              \
+    return statusor.status();                          \
+  }                                                    \
+  lhs = std::move(statusor.ValueOrDie())
 
-// =================================================================
-// == Implementation details, do not rely on anything below here. ==
-// =================================================================
-
-// MSVC incorrectly expands variadic macros, splice together a macro call to
-// work around the bug.
-#define STATUS_MACROS_IMPL_GET_VARIADIC_HELPER_(_1, _2, _3, NAME, ...) NAME
-#define STATUS_MACROS_IMPL_GET_VARIADIC_(args) \
-  STATUS_MACROS_IMPL_GET_VARIADIC_HELPER_ args
-
-#define STATUS_MACROS_IMPL_ASSIGN_OR_RETURN_2_(lhs, rexpr) \
-  STATUS_MACROS_IMPL_ASSIGN_OR_RETURN_3_(lhs, rexpr, std::move(_))
-#define STATUS_MACROS_IMPL_ASSIGN_OR_RETURN_3_(lhs, rexpr, error_expression) \
-  STATUS_MACROS_IMPL_ASSIGN_OR_RETURN_(                                      \
-      STATUS_MACROS_IMPL_CONCAT_(_status_or_value, __LINE__), lhs, rexpr,    \
-      error_expression)
-#define STATUS_MACROS_IMPL_ASSIGN_OR_RETURN_(statusor, lhs, rexpr,      \
-                                             error_expression)          \
-  auto statusor = (rexpr);                                              \
-  if (ABSL_PREDICT_FALSE(!statusor.ok())) {                             \
-    internal::StatusBuilder _(std::move(statusor).status(), __FILE__,   \
-                               __LINE__);                               \
-    (void)_; /* error_expression is allowed to not use this variable */ \
-    return (error_expression);                                          \
-  }                                                                     \
-  lhs = std::move(statusor).value()
-
-// Internal helper for concatenating macro values.
-#define STATUS_MACROS_IMPL_CONCAT_INNER_(x, y) x##y
-#define STATUS_MACROS_IMPL_CONCAT_(x, y) STATUS_MACROS_IMPL_CONCAT_INNER_(x, y)
-
-// The GNU compiler emits a warning for code like:
-//
-//   if (foo)
-//     if (bar) { } else baz;
-//
-// because it thinks you might want the else to bind to the first if.  This
-// leads to problems with code like:
-//
-//   if (do_expr) REVERB_RETURN_IF_ERROR(expr) << "Some message";
-//
-// The "switch (0) case 0:" idiom is used to suppress this.
-#define STATUS_MACROS_IMPL_ELSE_BLOCKER_ switch (0) case 0: default:  // NOLINT
-
-namespace deepmind {
-namespace reverb {
-namespace internal {
-namespace status_macro_internal {
-
-// Provides a conversion to bool so that it can be used inside an if statement
-// that declares a variable.
-class StatusAdaptorForMacros {
- public:
-  StatusAdaptorForMacros(const absl::Status& status, const char* file, int line)
-      : builder_(status, file, line) {}
-
-  StatusAdaptorForMacros(absl::Status&& status, const char* file, int line)
-      : builder_(std::move(status), file, line) {}
-
-  StatusAdaptorForMacros(const StatusBuilder& builder, const char* /* file */,
-                         int /* line */)
-      : builder_(builder) {}
-
-  StatusAdaptorForMacros(StatusBuilder&& builder, const char* /* file */,
-                         int /* line */)
-      : builder_(std::move(builder)) {}
-
-  StatusAdaptorForMacros(const StatusAdaptorForMacros&) = delete;
-  StatusAdaptorForMacros& operator=(const StatusAdaptorForMacros&) = delete;
-
-  explicit operator bool() const { return ABSL_PREDICT_TRUE(builder_.ok()); }
-
-  StatusBuilder&& Consume() {
-    return std::move(builder_);
-  }
-
- private:
-  StatusBuilder builder_;
-};
-
-}  // namespace status_macro_internal
-}  // namespace internal
-}  // namespace reverb
-}  // namespace deepmind
 
 #define REVERB_CHECK_OK(val) CHECK_EQ(::absl::OkStatus(), (val))
 
